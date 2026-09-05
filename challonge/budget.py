@@ -7,7 +7,14 @@ from datetime import datetime, timezone
 from typing import Protocol
 
 REASONS = frozenset(
-    {"admin:post", "admin:sync", "admin:report", "autosync", "standings"}
+    {
+        "admin:post",
+        "admin:entrants",
+        "admin:round-start",
+        "admin:report",
+        "autosync",
+        "standings",
+    }
 )
 ADMIN_REASONS = frozenset(r for r in REASONS if r.startswith("admin:"))
 

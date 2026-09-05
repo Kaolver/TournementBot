@@ -15,6 +15,7 @@ from cogs.common import (
     is_organizer_user,
     report_error,
     respond,
+    round_label,
 )
 from nullrush import RelayError
 from services import (
@@ -32,9 +33,6 @@ from services import (
 from timeparse import TimeParseError, parse_when
 
 log = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------- shared bits
 
 
 async def _opponent_of(bot, tournament_id: int, match: aiosqlite.Row, user_id: int):
@@ -60,6 +58,37 @@ async def _thread_context(bot, interaction: discord.Interaction):
     if tournament is None:
         raise BotError("That tournament no longer exists.")
     return tournament, match
+
+
+async def _play_by_of(bot, tournament: aiosqlite.Row, match: aiosqlite.Row):
+    from db.store import _parse_iso
+    from services import play_by_for
+
+    try:
+        stored = _parse_iso(match["play_by"])
+    except (KeyError, IndexError, ValueError):
+        stored = None
+    return stored or await play_by_for(bot, tournament, match)
+
+
+async def _check_within_round(
+    bot,
+    tournament: aiosqlite.Row,
+    match: aiosqlite.Row,
+    when: datetime,
+    interaction: discord.Interaction,
+) -> None:
+    play_by = await _play_by_of(bot, tournament, match)
+    if play_by is None or when <= play_by:
+        return
+    if await is_organizer_user(bot.store, interaction.guild_id, interaction.user):
+        return
+    raise BotError(
+        f"{round_label(match['round'])} has to be played by "
+        f"{discord_ts(play_by)} ({discord_ts(play_by, 'R')}), and that time is "
+        "after it.\nPick something earlier, or ask an organiser to move the "
+        "round."
+    )
 
 
 async def refresh_panel(bot, guild: discord.Guild, tournament: aiosqlite.Row) -> None:
@@ -165,9 +194,6 @@ class _BaseView(discord.ui.View):
             raise BotError("Organisers only.")
 
 
-# ------------------------------------------------------------------ sign-up
-
-
 class SignupModal(discord.ui.Modal, title="Sign up"):
     """Modal for tournament bracket registration."""
 
@@ -209,7 +235,6 @@ class SignupModal(discord.ui.Modal, title="Sign up"):
                 )
                 return
 
-            # Moving to a different name releases the old bracket entry.
             previous = await self.bot.store.participant_for_discord(
                 tournament_id, interaction.user.id
             )
@@ -235,9 +260,8 @@ class SignupModal(discord.ui.Modal, title="Sign up"):
             await respond(interaction, message)
 
             await refresh_panel(self.bot, interaction.guild, self.tournament)
-            # A newly linked player can complete a pairing that was waiting.
             self.bot.dispatch("player_claimed", self.tournament)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     async def _withdraw(
@@ -269,11 +293,8 @@ class SignupModal(discord.ui.Modal, title="Sign up"):
         await report_error(interaction, error)
 
 
-# ---------------------------------------------------------------- the panel
-
-
 class PanelView(_BaseView):
-    """The panel posted by /tournament post. The whole bot, in six buttons."""
+    """Tournament panel interaction view."""
 
     @discord.ui.button(
         label="Sign up",
@@ -297,7 +318,7 @@ class PanelView(_BaseView):
                     is_signed_up=existing is not None,
                 )
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -323,7 +344,7 @@ class PanelView(_BaseView):
                 ),
                 ephemeral=True,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -360,15 +381,12 @@ class PanelView(_BaseView):
                 ),
                 ephemeral=True,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
 
-# -------------------------------------------------------------- match thread
-
-
 class MatchThreadView(_BaseView):
-    """Pinned in every match thread. The whole player interface."""
+    """Match thread interaction view."""
 
     @discord.ui.button(
         label="Propose time",
@@ -392,6 +410,9 @@ class MatchThreadView(_BaseView):
                 )
 
             async def on_time(modal_interaction: discord.Interaction, moment):
+                await _check_within_round(
+                    self.bot, tournament, match, moment, modal_interaction
+                )
                 await modal_interaction.response.defer()
                 await send_proposal(
                     self.bot,
@@ -406,7 +427,7 @@ class MatchThreadView(_BaseView):
             await interaction.response.send_modal(
                 TimeModal(self.bot, title="Propose a match time", on_time=on_time)
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -446,7 +467,7 @@ class MatchThreadView(_BaseView):
                 f"<@{interaction.user.id}> cleared the agreed time. Propose a "
                 "new one; the deadline still applies."
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -482,7 +503,7 @@ class MatchThreadView(_BaseView):
                     "Back to a normal private match. Any server event for it "
                     "has been removed."
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
 
@@ -515,7 +536,7 @@ class MatchThreadView(_BaseView):
             await interaction.followup.send(embed=room_embed(match, names, code))
         except RelayError as exc:
             await report_error(interaction, BotError(str(exc)))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
 
@@ -563,7 +584,7 @@ class ResultView(_BaseView):
                 f"Entered on Challonge by <@{interaction.user.id}>.\n"
                 f"*Used 2 requests, {budget.used} of {budget.limit} this month.*"
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -582,15 +603,12 @@ class ResultView(_BaseView):
                 f"Left alone by <@{interaction.user.id}>. Enter it on "
                 "challonge.com if it should count."
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
 
-# ---------------------------------------------------------------- proposals
-
-
 class ProposalView(_BaseView):
-    """Accept, counter or decline. Answerable only by the opponent."""
+    """Match scheduling proposal view."""
 
     async def _resolve(self, interaction: discord.Interaction):
         proposal = await self.bot.store.proposal_for_message(interaction.message.id)
@@ -654,7 +672,7 @@ class ProposalView(_BaseView):
                     when,
                 )
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -687,7 +705,7 @@ class ProposalView(_BaseView):
                     self.bot, title="Suggest a different time", on_time=on_time
                 )
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -713,15 +731,12 @@ class ProposalView(_BaseView):
                 "another one; the deadline is still running.",
                 view=MatchThreadView(self.bot),
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
 
-# --------------------------------------------------------------- escalation
-
-
 class EscalationView(_BaseView):
-    """Organiser controls on a match that blew its scheduling deadline."""
+    """Deadline escalation organiser view."""
 
     async def _resolve(self, interaction: discord.Interaction):
         await self._require_organiser(interaction)
@@ -772,7 +787,7 @@ class EscalationView(_BaseView):
             await interaction.response.send_modal(
                 TimeModal(self.bot, title="Set the match time", on_time=on_time)
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -798,7 +813,7 @@ class EscalationView(_BaseView):
                 f"An organiser gave you until {discord_ts(deadline)} to "
                 "agree a time.",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
 
     @discord.ui.button(
@@ -819,5 +834,281 @@ class EscalationView(_BaseView):
             await interaction.followup.send(
                 f"Marked as handled by <@{interaction.user.id}>."
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await report_error(interaction, exc)
+
+
+class EntrantsSyncView(_BaseView):
+    """View for entrant sync results."""
+
+    @discord.ui.button(
+        label="Sync again",
+        style=discord.ButtonStyle.primary,
+        custom_id="tb:entrants:again",
+    )
+    async def again(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+            from cogs.tournament import run_entrant_sync
+
+            tournament = await active_tournament(interaction)
+            await run_entrant_sync(self.bot, interaction, tournament)
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Full entrant list",
+        style=discord.ButtonStyle.secondary,
+        custom_id="tb:entrants:list",
+    )
+    async def full_list(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+            from ui.embeds import entrants_embed
+
+            tournament = await active_tournament(interaction)
+            await interaction.followup.send(
+                embed=await entrants_embed(self.bot, tournament), ephemeral=True
+            )
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Start the round",
+        style=discord.ButtonStyle.success,
+        custom_id="tb:entrants:round",
+    )
+    async def start_round_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+            from cogs.tournament import run_round_start
+
+            tournament = await active_tournament(interaction)
+            await run_round_start(self.bot, interaction, tournament)
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+
+class RoundStartView(_BaseView):
+    """View for round start results."""
+
+    @discord.ui.button(
+        label="Open missing threads",
+        style=discord.ButtonStyle.primary,
+        custom_id="tb:round:threads",
+    )
+    async def threads(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+            from services import RoundStart
+            from ui.embeds import round_start_embed
+
+            tournament = await active_tournament(interaction)
+            tournament_id = int(tournament["challonge_id"])
+            cog = self.bot.get_cog("ThreadsCog")
+            if cog is None:
+                raise BotError("The thread manager is not loaded.")
+
+            report = await cog.open_threads(tournament, announce=False)
+            await interaction.followup.send(
+                embed=round_start_embed(
+                    tournament,
+                    RoundStart(
+                        opened=[],
+                        completed=[],
+                        report=report,
+                        open_matches=await self.bot.store.list_matches(
+                            tournament_id, state="open"
+                        ),
+                    ),
+                    names=await self.bot.store.participant_display(tournament_id),
+                    budget=await self.bot.budget.status(),
+                ),
+                view=RoundStartView(self.bot),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Announce in channel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="tb:round:announce",
+    )
+    async def announce(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+
+            tournament = await active_tournament(interaction)
+            tournament_id = int(tournament["challonge_id"])
+            cog = self.bot.get_cog("ThreadsCog")
+            channel = self.bot.get_channel(int(tournament["channel_id"] or 0))
+            if cog is None or channel is None:
+                raise BotError("I cannot see the tournament channel any more.")
+
+            matches = await self.bot.store.list_matches(tournament_id, state="open")
+            if not matches:
+                raise BotError("No match is open, so there is nothing to announce.")
+
+            message = await cog.announce_round(
+                channel,
+                tournament,
+                matches,
+                await self.bot.store.participant_display(tournament_id),
+            )
+            await interaction.followup.send(
+                f"Posted: {message.jump_url}"
+                if message
+                else "Discord refused the announcement; check my permissions "
+                f"in <#{channel.id}>.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Sync bracket again",
+        style=discord.ButtonStyle.secondary,
+        custom_id="tb:round:again",
+    )
+    async def again(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+            from cogs.tournament import run_round_start
+
+            tournament = await active_tournament(interaction)
+            await run_round_start(self.bot, interaction, tournament)
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Bracket",
+        style=discord.ButtonStyle.secondary,
+        custom_id="tb:round:bracket",
+    )
+    async def bracket(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+            from ui.embeds import bracket_embed
+
+            tournament = await active_tournament(interaction)
+            tournament_id = int(tournament["challonge_id"])
+            await interaction.followup.send(
+                embed=bracket_embed(
+                    tournament,
+                    await self.bot.store.list_matches(tournament_id),
+                    await self.bot.store.participant_display(tournament_id),
+                ),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+
+class RoundScheduleView(_BaseView):
+    """View for round schedule calendar."""
+
+    @discord.ui.button(
+        label="Re-stamp open matches",
+        style=discord.ButtonStyle.primary,
+        custom_id="tb:sched:apply",
+    )
+    async def apply(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+            from services import apply_round_plan
+            from ui.embeds import round_schedule_embed
+
+            tournament = await active_tournament(interaction)
+            touched = await apply_round_plan(self.bot, tournament)
+            await interaction.followup.send(
+                embed=await round_schedule_embed(
+                    self.bot, tournament, restamped=touched
+                ),
+                view=RoundScheduleView(self.bot),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Post in channel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="tb:sched:post",
+    )
+    async def post(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+            from ui.embeds import round_schedule_embed
+
+            tournament = await active_tournament(interaction)
+            channel = self.bot.get_channel(int(tournament["channel_id"] or 0))
+            if channel is None:
+                raise BotError("I cannot see the tournament channel any more.")
+            message = await channel.send(
+                content="**Match days**",
+                embed=await round_schedule_embed(self.bot, tournament),
+            )
+            await interaction.followup.send(
+                f"Posted: {message.jump_url}", ephemeral=True
+            )
+        except Exception as exc:
+            await report_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Clear calendar",
+        style=discord.ButtonStyle.danger,
+        custom_id="tb:sched:clear",
+    )
+    async def clear_calendar(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        try:
+            await self._require_organiser(interaction)
+            await interaction.response.defer(ephemeral=True)
+            from services import apply_round_plan
+            from ui.embeds import round_schedule_embed
+
+            tournament = await active_tournament(interaction)
+            await self.bot.store.set_guild_config(
+                interaction.guild_id, clear_schedule=True
+            )
+            touched = await apply_round_plan(self.bot, tournament)
+            await interaction.followup.send(
+                content=(
+                    "Calendar cleared. Matches now run on the agree-a-time "
+                    f"deadline alone; {touched} match(es) re-stamped."
+                ),
+                embed=await round_schedule_embed(self.bot, tournament),
+                view=RoundScheduleView(self.bot),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await report_error(interaction, exc)
+

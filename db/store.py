@@ -24,6 +24,9 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         "event_channel_id": "INTEGER",
         "event_location": "TEXT",
         "event_duration": "INTEGER NOT NULL DEFAULT 60",
+        "first_match_day": "TEXT",
+        "days_per_round": "INTEGER NOT NULL DEFAULT 0",
+        "round_days": "TEXT",
     },
     "tournaments": {
         "bracket_message_id": "INTEGER",
@@ -42,6 +45,7 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         "event_id": "INTEGER",
         "escalation_message_id": "INTEGER",
         "room_code": "TEXT",
+        "play_by": "TEXT",
     },
 }
 
@@ -171,6 +175,10 @@ class Store:
         event_location: str | None = None,
         event_duration: int | None = None,
         clear_event_channel: bool = False,
+        first_match_day: str | None = None,
+        days_per_round: int | None = None,
+        round_days: str | None = None,
+        clear_schedule: bool = False,
     ) -> None:
         await self.db.execute(
             "INSERT OR IGNORE INTO guilds (guild_id) VALUES (?)", (guild_id,)
@@ -206,6 +214,20 @@ class Store:
             values.append(event_channel_id)
         elif clear_event_channel:
             updates.append("event_channel_id = NULL")
+        if clear_schedule:
+            updates.append("first_match_day = NULL")
+            updates.append("days_per_round = 0")
+            updates.append("round_days = NULL")
+        else:
+            if first_match_day is not None:
+                updates.append("first_match_day = ?")
+                values.append(first_match_day)
+            if days_per_round is not None:
+                updates.append("days_per_round = ?")
+                values.append(days_per_round)
+            if round_days is not None:
+                updates.append("round_days = ?")
+                values.append(round_days or None)
         if updates:
             values.append(guild_id)
             await self.db.execute(
@@ -661,12 +683,16 @@ class Store:
         await self.db.commit()
 
     async def matches_needing_threads(
-        self, tournament_id: int
+        self, tournament_id: int, *, include_pending: bool = False
     ) -> list[aiosqlite.Row]:
+        """Matches with both players known and no thread yet."""
+        state_clause = (
+            "state <> 'complete'" if include_pending else "state = 'open'"
+        )
         async with self.db.execute(
-            """
+            f"""
             SELECT * FROM matches
-            WHERE tournament_id = ? AND state = 'open' AND thread_id IS NULL
+            WHERE tournament_id = ? AND {state_clause} AND thread_id IS NULL
               AND player1_id IS NOT NULL AND player2_id IS NOT NULL
             ORDER BY round, COALESCE(play_order, match_id)
             """,
@@ -801,6 +827,16 @@ class Store:
         await self.db.commit()
 
     # ----------------------------------------------------- match scheduling
+
+    async def set_match_play_by(
+        self, tournament_id: int, match_id: int, when: datetime | None
+    ) -> None:
+        await self.db.execute(
+            "UPDATE matches SET play_by = ? WHERE tournament_id = ? "
+            "AND match_id = ?",
+            (_iso(when) if when else None, tournament_id, match_id),
+        )
+        await self.db.commit()
 
     async def set_match_deadline(
         self, tournament_id: int, match_id: int, when: datetime | None

@@ -53,11 +53,14 @@ class TournamentBot(commands.Bot):
             )
 
         from ui.views import (
+            EntrantsSyncView,
             EscalationView,
             MatchThreadView,
             PanelView,
             ProposalView,
             ResultView,
+            RoundScheduleView,
+            RoundStartView,
         )
 
         for view in (
@@ -66,6 +69,9 @@ class TournamentBot(commands.Bot):
             ProposalView(self),
             EscalationView(self),
             ResultView(self),
+            EntrantsSyncView(self),
+            RoundStartView(self),
+            RoundScheduleView(self),
         ):
             self.add_view(view)
 

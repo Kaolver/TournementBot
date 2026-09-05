@@ -37,8 +37,16 @@ def _when(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def _column(row: aiosqlite.Row, name: str):
+    """Safely get column value from row."""
+    try:
+        return row[name]
+    except (KeyError, IndexError):
+        return None
+
+
 def _truncate(lines: Sequence[str], limit: int, noun: str, max_chars: int = 1000) -> str:
-    """Join lines, replacing the tail with a count once they stop fitting."""
+    """Join lines, truncating with a summary if limit is reached."""
     if not lines:
         return ""
     shown: list[str] = []
@@ -58,11 +66,8 @@ def _truncate(lines: Sequence[str], limit: int, noun: str, max_chars: int = 1000
     return "\n".join(shown)
 
 
-# ----------------------------------------------------------------- the panel
-
-
 async def panel_embed(bot, tournament: aiosqlite.Row) -> discord.Embed:
-    """The one message players interact with, posted by /tournament post."""
+    """Build the tournament panel embed."""
     tournament_id = int(tournament["challonge_id"])
     participants = await bot.store.list_participants(tournament_id)
     signups = await bot.store.list_signups(tournament_id)
@@ -109,7 +114,7 @@ async def panel_embed(bot, tournament: aiosqlite.Row) -> discord.Embed:
 
 
 async def entrants_embed(bot, tournament: aiosqlite.Row) -> discord.Embed:
-    """Admin view of the two lists and how well they line up."""
+    """Build the entrants overview embed."""
     tournament_id = int(tournament["challonge_id"])
     participants = await bot.store.list_participants(tournament_id)
     signups = await bot.store.list_signups(tournament_id)
@@ -168,7 +173,7 @@ def settings_embed(
     *,
     syncs_per_day: int,
 ) -> discord.Embed:
-    """Shown by /tournament settings: what is configured, what is missing."""
+    """Build the tournament settings embed."""
     embed = discord.Embed(
         title="Settings",
         colour=ACCENT,
@@ -194,6 +199,30 @@ def settings_embed(
         value=f"{(config['event_duration'] if config else 60) or 60} min",
         inline=True,
     )
+
+    first_day = _column(config, "first_match_day") if config else None
+    custom = (_column(config, "round_days") if config else None) or ""
+    per_round = int((_column(config, "days_per_round") if config else 0) or 0)
+    embed.add_field(
+        name="Match days",
+        value=(
+            (
+                f"Round one **{first_day}**, then "
+                + (
+                    f"days **{custom}**"
+                    if custom.strip()
+                    else (
+                        f"**{per_round}** day(s) apart"
+                        if per_round
+                        else "**all on that day**"
+                    )
+                )
+            )
+            if first_day
+            else "*not set* · `/tournament round schedule`"
+        ),
+        inline=False,
+    )
     embed.add_field(
         name="Featured matches happen",
         value=(
@@ -216,7 +245,7 @@ def settings_embed(
 
     me = guild.me
     needed = {
-        "Create Private Threads": me.guild_permissions.create_private_threads,
+        "Create Public Threads": me.guild_permissions.create_public_threads,
         "Send Messages in Threads": me.guild_permissions.send_messages_in_threads,
         "Manage Threads": me.guild_permissions.manage_threads,
         "Manage Events": me.guild_permissions.manage_events,
@@ -243,15 +272,13 @@ def settings_embed(
     return embed
 
 
-# ------------------------------------------------------------ match thread
-
-
 def match_thread_embed(
     tournament: aiosqlite.Row, match: aiosqlite.Row, names: dict[int, str]
 ) -> discord.Embed:
     is_live = bool(match["live"])
     scheduled = _when(match["scheduled_at"])
     deadline = _when(match["deadline_at"])
+    play_by = _when(_column(match, "play_by"))
 
     embed = discord.Embed(
         title=match_title(match, names),
@@ -280,6 +307,25 @@ def match_thread_embed(
             inline=False,
         )
 
+    if play_by:
+        late = scheduled is not None and scheduled > play_by
+        embed.add_field(
+            name=f"{round_label(match['round'])} closes",
+            value=(
+                f"{discord_ts(play_by)} ({discord_ts(play_by, 'R')})\n"
+                + (
+                    "**Your agreed time is after that.** Either move the match "
+                    "or ask an organiser to move the round."
+                    if late
+                    else "Play by then. That is what keeps the tournament to "
+                    "its length."
+                )
+            ),
+            inline=False,
+        )
+        if late:
+            embed.colour = WARN
+
     embed.add_field(
         name="What to do",
         value=(
@@ -292,7 +338,8 @@ def match_thread_embed(
         inline=False,
     )
     embed.set_footer(
-        text="Only you two and the organisers can see this thread."
+        text="Public thread: the server can read along, but only you two "
+        "and the organisers use the buttons."
         + (" Featured matches get a server event." if is_live else "")
     )
     return embed
@@ -301,7 +348,7 @@ def match_thread_embed(
 def room_embed(
     match: aiosqlite.Row, names: dict[int, str], code: str
 ) -> discord.Embed:
-    """The room code, big enough to read off a second monitor."""
+    """Build the match room embed."""
     embed = discord.Embed(
         title="Match Room Open",
         colour=GOOD,
@@ -329,7 +376,7 @@ def reported_embed(
     winner_id: int | None,
     scores: str,
 ) -> discord.Embed:
-    """What Null Rush said happened. Not yet on the bracket."""
+    """Build the reported match result embed."""
     winner = names.get(winner_id, "the winner") if winner_id else "somebody"
     embed = discord.Embed(
         title="Result Reported by Null Rush",
@@ -454,9 +501,6 @@ def escalation_embed(
         embed.add_field(name="Thread", value=f"<#{match['thread_id']}>", inline=False)
     embed.set_footer(text="Set a time yourself, give them longer, or dismiss this.")
     return embed
-
-
-# ------------------------------------------------------------ public views
 
 
 def bracket_embed(
@@ -645,33 +689,355 @@ def round_announcement_embed(
     matches: Sequence[aiosqlite.Row],
     names: dict[int, str],
 ) -> discord.Embed:
+    """Build the round announcement embed."""
     rounds = sorted({int(m["round"]) for m in matches}, key=lambda r: (r < 0, abs(r)))
-    heading = " and ".join(round_label(r) for r in rounds)
+    heading = " and ".join(round_label(r) for r in rounds) or "Next round"
 
     embed = discord.Embed(
         title=f"Round: {heading}",
         url=_url(tournament),
         colour=ACCENT,
-        description=f"{len(matches)} match(es) just opened.",
-    )
-    embed.add_field(
-        name="Matches",
-        value=_truncate(
-            [
-                f"{'[Live] ' if m['live'] else ''}**{match_title(m, names)}**"
-                + (f" · <#{m['thread_id']}>" if m["thread_id"] else "")
-                for m in matches
-            ],
-            15,
-            "matches",
+        description=(
+            f"**{len(matches)}** match(es) are live. Every one has its own "
+            "thread below - open yours and agree a time."
         ),
-        inline=False,
     )
-    embed.set_footer(text="Players: open your thread and agree a time.")
+    for group, rows in _by_round(matches):
+        embed.add_field(
+            name=group,
+            value=_round_value(rows, names) or "*none*",
+            inline=False,
+        )
+    embed.set_footer(
+        text="Threads are public: anyone can follow along, only the two "
+        "players and the organisers act."
+    )
     return embed
 
 
-# ----------------------------------------------------------------- board
+def _by_round(
+    matches: Sequence[aiosqlite.Row],
+) -> list[tuple[str, list[aiosqlite.Row]]]:
+    """Group matches by round number."""
+    buckets: dict[int, list[aiosqlite.Row]] = {}
+    for match in matches:
+        buckets.setdefault(int(match["round"] or 0), []).append(match)
+    order = sorted(buckets, key=lambda r: (r < 0, abs(r)))
+    return [(round_label(r), buckets[r]) for r in order]
+
+
+def _match_line(match: aiosqlite.Row, names: dict[int, str]) -> str:
+    live = f"{LIVE_DOT} " if match["live"] else ""
+    thread = f" · <#{match['thread_id']}>" if match["thread_id"] else " · *no thread*"
+    return f"{live}**{match_title(match, names)}**{thread}"
+
+
+def _round_value(rows: Sequence[aiosqlite.Row], names: dict[int, str]) -> str:
+    """Format match lines for a round."""
+    play_by = _when(_column(rows[0], "play_by")) if rows else None
+    header = f"-# Play by {discord_ts(play_by, 'D')}\n" if play_by else ""
+    return header + _truncate([_match_line(m, names) for m in rows], 12, "matches")
+
+
+async def round_schedule_embed(
+    bot, tournament: aiosqlite.Row, *, restamped: int = 0
+) -> discord.Embed:
+    """Build the round schedule embed."""
+    from services import (
+        MAX_TOURNAMENT_DAYS,
+        end_of_day,
+        guild_timezone,
+        late_matches,
+        round_plan,
+    )
+    from timeparse import get_zone
+
+    tournament_id = int(tournament["challonge_id"])
+    matches = await bot.store.list_matches(tournament_id)
+    plan = await round_plan(bot, tournament)
+
+    embed = discord.Embed(
+        title=tournament["name"],
+        url=_url(tournament),
+        colour=ACCENT,
+        description="**Round calendar**",
+    )
+    if plan is None:
+        embed.colour = MUTED
+        embed.add_field(
+            name="No match days set",
+            value=(
+                "Matches are only bounded by the agree-a-time deadline, so the "
+                "event runs as long as the players take."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Set one",
+            value=(
+                "`/tournament round schedule first_day:2026-09-12 "
+                "days_per_round:7`\nRound one on the 12th, every later round a "
+                "week after the one before.\n"
+                "Uneven gaps: `round_days:0,3,7,10`, counted in days from the "
+                "first match day.\n"
+                "Every match then has to be played by the end of its round's "
+                "day, and the bot says so in the thread.\n"
+                f"A tournament runs **{MAX_TOURNAMENT_DAYS} days at the most**, "
+                "so anything later is pulled back onto the last day."
+            ),
+            inline=False,
+        )
+        return embed
+
+    zone = get_zone(await guild_timezone(bot, int(tournament["guild_id"])))
+    counts: dict[int, list[aiosqlite.Row]] = {}
+    for match in matches:
+        counts.setdefault(int(match["round"] or 0), []).append(match)
+
+    embed.add_field(
+        name="First match day",
+        value=discord_ts(end_of_day(plan.first_day, zone), "D"),
+        inline=True,
+    )
+    embed.add_field(
+        name="Rounds", value=str(len(plan.order)), inline=True
+    )
+    embed.add_field(
+        name="Whole event",
+        value=f"**{plan.total_days}** of {MAX_TOURNAMENT_DAYS} day(s)",
+        inline=True,
+    )
+
+    lines = []
+    for round_number in plan.order:
+        day = plan.days[round_number]
+        rows = counts.get(round_number, [])
+        played = sum(1 for m in rows if m["state"] == "complete")
+        detail = (
+            f"{played}/{len(rows)} played"
+            if rows
+            else "not drawn yet"
+        )
+        lines.append(
+            f"**{round_label(round_number)}** · "
+            f"{discord_ts(end_of_day(day, zone), 'D')} · {detail}"
+        )
+    embed.add_field(
+        name="Play by",
+        value=_truncate(lines, 15, "rounds", max_chars=1000),
+        inline=False,
+    )
+    embed.add_field(
+        name="Ends",
+        value=(
+            f"{discord_ts(end_of_day(plan.last_day, zone))} "
+            f"({discord_ts(end_of_day(plan.last_day, zone), 'R')})"
+        ),
+        inline=False,
+    )
+
+    if plan.clamped:
+        embed.colour = WARN
+        embed.add_field(
+            name="Held to two weeks",
+            value=(
+                "These rounds fell past the "
+                f"{MAX_TOURNAMENT_DAYS}-day limit and now share the last day: "
+                + ", ".join(round_label(r) for r in plan.clamped)
+                + ".\nShorten the gap between rounds to spread them out."
+            ),
+            inline=False,
+        )
+
+    late = late_matches(m for m in matches if m["state"] == "open")
+    if late:
+        embed.colour = WARN
+        names = await bot.store.participant_display(tournament_id)
+        embed.add_field(
+            name=f"Agreed after their round ({len(late)})",
+            value=_truncate(
+                [
+                    f"**{match_title(m, names)}** · "
+                    f"{discord_ts(_when(m['scheduled_at']), 'f')}"
+                    for m in late
+                ],
+                6,
+                "matches",
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=(
+            f"{restamped} match(es) re-stamped with the new days. "
+            if restamped
+            else ""
+        )
+        + "Deadlines never run past the end of a round, and no tournament "
+        f"runs longer than {MAX_TOURNAMENT_DAYS} days."
+    )
+    return embed
+
+
+def _bar(done: int, total: int, width: int = 12) -> str:
+    """Generate a plain-text progress bar."""
+    if total <= 0:
+        return "-" * width
+    filled = max(0, min(width, round(width * done / total)))
+    return "#" * filled + "-" * (width - filled)
+
+
+def entrants_sync_embed(
+    tournament: aiosqlite.Row,
+    result,
+    *,
+    budget: BudgetStatus,
+    thread_joins: int = 0,
+) -> discord.Embed:
+    """Build the entrants sync result embed."""
+    total = len(result.participants)
+    linked = result.linked_total
+
+    embed = discord.Embed(
+        title=tournament["name"],
+        url=_url(tournament),
+        colour=GOOD if linked == total and total else ACCENT,
+        description="**Entrants synced**",
+    )
+    embed.add_field(name="On the bracket", value=str(total), inline=True)
+    embed.add_field(
+        name="Signed up here", value=str(len(result.signups)), inline=True
+    )
+    embed.add_field(
+        name="Newly linked",
+        value=str(result.linked_now) if result.linked_now else "none",
+        inline=True,
+    )
+    embed.add_field(
+        name="Linked to Discord",
+        value=f"`{_bar(linked, total)}` **{linked}** of {total}",
+        inline=False,
+    )
+
+    if result.linked_now:
+        note = (
+            f"**{result.linked_now}** sign-up(s) just matched their bracket name."
+        )
+        if thread_joins:
+            note += f" Added to **{thread_joins}** match thread(s)."
+        embed.add_field(name="Linked this sync", value=note, inline=False)
+
+    if result.waiting:
+        embed.add_field(
+            name=f"Waiting for the bracket ({len(result.waiting)})",
+            value=_truncate(
+                [
+                    f"<@{int(row['discord_user_id'])}> wants **{row['name']}**"
+                    for row in result.waiting
+                ],
+                15,
+                "players",
+            )
+            + "\n*Add those names on Challonge, then sync again.*",
+            inline=False,
+        )
+
+    if result.bracket_only:
+        embed.add_field(
+            name=f"Challonge only ({len(result.bracket_only)})",
+            value=_truncate(
+                [row["name"] for row in result.bracket_only], 15, "players"
+            )
+            + "\n*Never pinged. Their matches still get a thread.*",
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"Challonge requests this month: {budget.used}/{budget.limit}. "
+        "Entrants only - use /tournament round start for the matches."
+    )
+    return embed
+
+
+def round_start_embed(
+    tournament: aiosqlite.Row,
+    result,
+    *,
+    names: dict[int, str],
+    budget: BudgetStatus,
+) -> discord.Embed:
+    """Build the round start result embed."""
+    report = result.report
+    created, existing, failed = report.created, report.existing, report.failed
+    live = result.open_matches
+
+    embed = discord.Embed(
+        title=tournament["name"],
+        url=_url(tournament),
+        colour=BAD if (failed or report.error) else GOOD,
+        description="**Round started**",
+    )
+    embed.add_field(name="Matches live", value=str(len(live)), inline=True)
+    embed.add_field(name="Threads opened", value=str(len(created)), inline=True)
+    embed.add_field(name="Already had one", value=str(len(existing)), inline=True)
+
+    if result.opened or result.completed:
+        embed.add_field(
+            name="Bracket moved",
+            value=(
+                f"**{len(result.opened)}** newly open, "
+                f"**{len(result.completed)}** newly completed."
+            ),
+            inline=False,
+        )
+
+    if live:
+        for group, rows in _by_round(live):
+            embed.add_field(
+                name=group, value=_round_value(rows, names), inline=False
+            )
+    else:
+        embed.add_field(
+            name="Nothing open",
+            value=(
+                "No match is open on Challonge. Start the tournament there, "
+                "or enter the outstanding results, then run this again."
+            ),
+            inline=False,
+        )
+
+    if report.invited or report.unreachable:
+        value = f"**{report.invited}** player(s) added to their thread."
+        if report.unreachable:
+            unique = sorted(set(report.unreachable))
+            value += (
+                f"\n**{len(unique)}** not on Discord: "
+                + _truncate(unique, 10, "players", max_chars=400)
+                + "\nTheir threads exist all the same; nobody is pinged."
+            )
+        embed.add_field(name="Players", value=value, inline=False)
+
+    if failed:
+        embed.add_field(
+            name=f"Could not open ({len(failed)})",
+            value=_truncate(
+                [
+                    f"**{match_title(m, names)}** - {why}"
+                    for m, why in failed
+                ],
+                6,
+                "matches",
+            ),
+            inline=False,
+        )
+    if report.error:
+        embed.add_field(name="Fix this first", value=report.error, inline=False)
+
+    embed.set_footer(
+        text=f"Challonge requests this month: {budget.used}/{budget.limit}. "
+        "Threads are public; who may see them is a channel permission."
+    )
+    return embed
 
 
 def board_embed(
@@ -687,8 +1053,9 @@ def board_embed(
     total_matches: int,
     completed_matches: int,
     threadless: int,
+    schedule: str | None = None,
 ) -> discord.Embed:
-    """The organiser board: progress, who is stalling, and quota left."""
+    """Build the organiser board embed."""
     embed = discord.Embed(
         title=tournament["name"],
         url=_url(tournament),
@@ -703,6 +1070,8 @@ def board_embed(
         inline=True,
     )
     embed.add_field(name="Open now", value=str(len(open_matches)), inline=True)
+    if schedule:
+        embed.add_field(name="Match days", value=schedule, inline=False)
 
     grouped: dict[str, list[aiosqlite.Row]] = {}
     for match in open_matches:
@@ -722,7 +1091,7 @@ def board_embed(
             elif match["deadline_at"]:
                 detail = f"due {discord_ts(_when(match['deadline_at']), 'R')}"
             else:
-                detail = "no thread, players not linked"
+                detail = "no thread yet - /tournament round start"
             lines.append(f"{live}**{title}**{thread}\n {detail}")
         embed.add_field(
             name=f"{STATUS_LABEL[status]} ({len(rows)})",
@@ -782,9 +1151,12 @@ def command_help_embed() -> discord.Embed:
             "**Sign up** on the panel and give the name you play under on the "
             "bracket. That is the only thing you ever have to do.\n"
             "**Bracket** and **My match** show where things stand.\n"
-            "When your match opens you get a private thread with your "
-            "opponent. **Propose time**, they accept or counter, and you both "
-            "get reminded before it starts."
+            "When your match opens you are added to its thread. **Propose "
+            "time**, your opponent accepts or counters, and you both get "
+            "reminded before it starts. Threads are public, so the rest of "
+            "the server can follow the match.\n"
+            "If the organisers set match days, your thread says which day your "
+            "round has to be played by, and you cannot book past it."
         ),
         inline=False,
     )
@@ -792,7 +1164,11 @@ def command_help_embed() -> discord.Embed:
         name="If you are a tournament admin",
         value=(
             "`/tournament post` panel for a bracket (3 requests)\n"
-            "`/tournament sync` read it right now (1 request)\n"
+            "`/tournament sync entrants` re-read the entrant list (1 request)\n"
+            "`/tournament round start` read the matches, open every thread, "
+            "invite the players (1 request)\n"
+            "`/tournament round schedule` set the match days, and see how long "
+            "the whole event will take\n"
             "`/tournament settings` timezone, deadline, admin role, featured venue\n"
             "`/tournament board` progress and who is stalling\n"
             "`/tournament entrants` who signed up, who matched\n"

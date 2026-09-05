@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Iterable, Sequence
 
 import aiosqlite
 import discord
 
 from db.store import _parse_iso
+from timeparse import get_zone
 
 log = logging.getLogger(__name__)
 
@@ -210,7 +212,6 @@ async def ensure_participants(
         tournament_id,
         await bot.challonge.list_participants(tournament_id, reason=reason),
     )
-    # New bracket entries may be people who already signed up on Discord.
     await bot.store.link_signups_to_bracket(tournament_id)
 
 
@@ -233,9 +234,190 @@ async def check_finished(bot, tournament: aiosqlite.Row, matches) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Scheduling handshake
-# ---------------------------------------------------------------------------
+MAX_TOURNAMENT_DAYS = 14
+MAX_ROUND_DAYS = MAX_TOURNAMENT_DAYS - 1
+
+
+def round_sequence(rounds: Iterable[int]) -> list[int]:
+    """Order round numbers as played (interleaving losers rounds)."""
+    return sorted({int(r) for r in rounds}, key=lambda r: (abs(r), r < 0))
+
+
+def parse_round_days(text: str | None) -> list[int]:
+    """Parse comma-separated day offsets."""
+    if not text or not text.strip():
+        return []
+    offsets: list[int] = []
+    for chunk in text.replace(" ", "").split(","):
+        if not chunk:
+            continue
+        value = int(chunk)
+        if not 0 <= value <= MAX_ROUND_DAYS:
+            raise ValueError(f"{value} is not between 0 and {MAX_ROUND_DAYS}")
+        offsets.append(value)
+    if offsets != sorted(offsets):
+        raise ValueError("the days have to go forwards, not backwards")
+    return offsets
+
+
+def round_offsets(
+    count: int, *, days_per_round: int = 0, custom: Sequence[int] = ()
+) -> list[int]:
+    """Calculate day offsets for each round, clamped to MAX_ROUND_DAYS."""
+    return [
+        min(max(offset, 0), MAX_ROUND_DAYS)
+        for offset in round_offsets_unclamped(
+            count, days_per_round=days_per_round, custom=custom
+        )
+    ]
+
+
+@dataclass(frozen=True)
+class RoundPlan:
+    first_day: date
+    order: list[int]
+    days: dict[int, date]
+    clamped: list[int] = field(default_factory=list)
+
+    @property
+    def last_day(self) -> date:
+        return max(self.days.values()) if self.days else self.first_day
+
+    @property
+    def total_days(self) -> int:
+        return (self.last_day - self.first_day).days + 1
+
+    def day_for(self, round_number: int) -> date | None:
+        return self.days.get(int(round_number))
+
+
+def parse_day(text: str) -> date:
+    return date.fromisoformat(text.strip())
+
+
+def build_round_plan(
+    rounds: Iterable[int],
+    *,
+    first_day: date,
+    days_per_round: int = 0,
+    custom: Sequence[int] = (),
+) -> RoundPlan:
+    order = round_sequence(rounds)
+    offsets = round_offsets(
+        len(order), days_per_round=days_per_round, custom=custom
+    )
+    wanted = round_offsets_unclamped(
+        len(order), days_per_round=days_per_round, custom=custom
+    )
+    return RoundPlan(
+        first_day=first_day,
+        order=order,
+        days={r: first_day + timedelta(days=o) for r, o in zip(order, offsets)},
+        clamped=[
+            r for r, want, got in zip(order, wanted, offsets) if want != got
+        ],
+    )
+
+
+def round_offsets_unclamped(
+    count: int, *, days_per_round: int = 0, custom: Sequence[int] = ()
+) -> list[int]:
+    if count <= 0:
+        return []
+    if custom:
+        offsets = list(custom[:count])
+        gap = (custom[-1] - custom[-2]) if len(custom) >= 2 else max(days_per_round, 0)
+        while len(offsets) < count:
+            offsets.append(offsets[-1] + gap)
+        return offsets
+    step = max(int(days_per_round or 0), 0)
+    return [i * step for i in range(count)]
+
+
+def end_of_day(day: date, tz) -> datetime:
+    return datetime.combine(
+        day, time(23, 59), tzinfo=tz
+    ).astimezone(timezone.utc)
+
+
+async def round_plan(bot, tournament: aiosqlite.Row) -> RoundPlan | None:
+    """The calendar for this bracket, or None when nobody set one."""
+    config = await guild_config(bot, int(tournament["guild_id"]))
+    if config is None:
+        return None
+    try:
+        raw = config["first_match_day"]
+    except (KeyError, IndexError):
+        return None
+    if not raw:
+        return None
+
+    try:
+        first_day = parse_day(str(raw))
+        custom = parse_round_days(config["round_days"])
+    except (ValueError, KeyError, IndexError):
+        log.warning("guild %s has an unreadable round plan", tournament["guild_id"])
+        return None
+
+    matches = await bot.store.list_matches(int(tournament["challonge_id"]))
+    rounds = [int(m["round"] or 0) for m in matches]
+    if not rounds:
+        rounds = [1]
+    try:
+        days_per_round = int(config["days_per_round"] or 0)
+    except (TypeError, ValueError, KeyError, IndexError):
+        days_per_round = 0
+    return build_round_plan(
+        rounds,
+        first_day=first_day,
+        days_per_round=days_per_round,
+        custom=custom,
+    )
+
+
+async def play_by_for(
+    bot, tournament: aiosqlite.Row, match: aiosqlite.Row, plan: RoundPlan | None = None
+) -> datetime | None:
+    """Return the play-by deadline for a match."""
+    plan = plan if plan is not None else await round_plan(bot, tournament)
+    if plan is None:
+        return None
+    day = plan.day_for(int(match["round"] or 0))
+    if day is None:
+        return None
+    zone = get_zone(await guild_timezone(bot, int(tournament["guild_id"])))
+    return end_of_day(day, zone)
+
+
+async def apply_round_plan(bot, tournament: aiosqlite.Row) -> int:
+    """Update play-by timestamps for unplayed matches."""
+    tournament_id = int(tournament["challonge_id"])
+    plan = await round_plan(bot, tournament)
+    touched = 0
+    for match in await bot.store.list_matches(tournament_id):
+        if match["state"] == "complete":
+            continue
+        play_by = await play_by_for(bot, tournament, match, plan)
+        await bot.store.set_match_play_by(
+            tournament_id, int(match["match_id"]), play_by
+        )
+        touched += 1
+        if match["state"] == "open" and not match["scheduled_at"]:
+            await start_scheduling_window(
+                bot, tournament, match, plan=plan, restart=True
+            )
+    return touched
+
+
+def late_matches(matches: Iterable[aiosqlite.Row]) -> list[aiosqlite.Row]:
+    """Return open matches scheduled after their round play-by date."""
+    late = []
+    for match in matches:
+        play_by = _parse_iso(match["play_by"]) if "play_by" in match.keys() else None
+        scheduled = _parse_iso(match["scheduled_at"])
+        if play_by and scheduled and scheduled > play_by:
+            late.append(match)
+    return late
 
 
 async def guild_config(bot, guild_id: int) -> aiosqlite.Row | None:
@@ -256,28 +438,49 @@ async def deadline_hours(bot, guild_id: int) -> int:
 
 
 async def start_scheduling_window(
-    bot, tournament: aiosqlite.Row, match: aiosqlite.Row
+    bot,
+    tournament: aiosqlite.Row,
+    match: aiosqlite.Row,
+    *,
+    plan: RoundPlan | None = None,
+    restart: bool = False,
 ) -> datetime | None:
-    """Stamp the agree-a-time deadline and queue its nudges.
-
-    Called when a match thread is created. ``0`` hours disables the deadline
-    entirely, which is how a guild opts out.
-    """
+    """Initialize match play-by and scheduling deadlines."""
     hours = await deadline_hours(bot, int(tournament["guild_id"]))
     tournament_id = int(tournament["challonge_id"])
     match_id = int(match["match_id"])
+    now = datetime.now(timezone.utc)
 
-    if hours <= 0:
+    play_by = await play_by_for(bot, tournament, match, plan)
+    await bot.store.set_match_play_by(tournament_id, match_id, play_by)
+
+    deadline = now + timedelta(hours=hours) if hours > 0 else None
+    if play_by is not None and (deadline is None or play_by < deadline):
+        deadline = play_by
+
+    if deadline is None:
         await bot.store.set_match_deadline(tournament_id, match_id, None)
+        if restart:
+            await clear_deadline_reminders(bot, tournament_id, match_id)
         return None
 
-    now = datetime.now(timezone.utc)
-    deadline = now + timedelta(hours=hours)
+    if deadline <= now:
+        await bot.store.set_match_deadline(tournament_id, match_id, deadline)
+        if restart:
+            await clear_deadline_reminders(bot, tournament_id, match_id)
+        await bot.store.schedule_reminder(
+            tournament_id, match_id, "sched_deadline", now
+        )
+        return deadline
+
     await bot.store.set_match_deadline(tournament_id, match_id, deadline)
     await bot.store.set_scheduling_status(tournament_id, match_id, "pending")
 
+    if restart:
+        await clear_deadline_reminders(bot, tournament_id, match_id)
+    window = deadline - now
     for kind, fraction in DEADLINE_NUDGES:
-        fire_at = now + timedelta(hours=hours * fraction)
+        fire_at = now + window * fraction
         if fire_at > now:
             await bot.store.schedule_reminder(tournament_id, match_id, kind, fire_at)
     return deadline
@@ -286,7 +489,6 @@ async def start_scheduling_window(
 async def clear_deadline_reminders(
     bot, tournament_id: int, match_id: int
 ) -> None:
-    """Drop the nudges once a time is agreed, keeping the match reminders."""
     for kind in DEADLINE_KINDS:
         await bot.store.cancel_reminder(tournament_id, match_id, kind)
 
@@ -300,7 +502,6 @@ async def propose_time(
     responder_id: int | None,
     when: datetime,
 ) -> int:
-    """Offer a time. Nothing is agreed until the opponent accepts."""
     tournament_id = int(tournament["challonge_id"])
     match_id = int(match["match_id"])
     proposal_id = await bot.store.create_proposal(
@@ -320,7 +521,6 @@ async def accept_proposal(
     match: aiosqlite.Row,
     proposal: aiosqlite.Row,
 ) -> datetime:
-    """Both sides agree: lock the time in, queue reminders, publish if live."""
     tournament_id = int(tournament["challonge_id"])
     match_id = int(match["match_id"])
     when = _parse_iso(proposal["proposed_at"])
@@ -335,7 +535,6 @@ async def accept_proposal(
     refreshed = await bot.store.get_match(tournament_id, match_id)
     if refreshed is not None:
         await sync_event(bot, tournament, refreshed)
-        # A confirmed time is also a hint about when to look for the result.
         probe = next_probe_at(when, datetime.now(timezone.utc))
         if probe is not None:
             await bot.store.request_refresh_no_later_than(tournament_id, probe)
@@ -345,7 +544,7 @@ async def accept_proposal(
 async def force_time(
     bot, tournament: aiosqlite.Row, match: aiosqlite.Row, when: datetime
 ) -> None:
-    """Organiser override, sets the time without a handshake."""
+    """Set match time directly without handshake."""
     tournament_id = int(tournament["challonge_id"])
     match_id = int(match["match_id"])
 
@@ -362,11 +561,10 @@ async def force_time(
 async def queue_match_reminders(
     bot, tournament_id: int, match_id: int, when: datetime
 ) -> None:
-    """T-1h and T-5m pings. Costs no API calls."""
+    """Queue reminders before the match."""
     now = datetime.now(timezone.utc)
     for kind, offset in REMINDER_OFFSETS:
         fire_at = when - offset
-        # Skip reminders that would fire immediately for a last-minute booking.
         if fire_at > now:
             await bot.store.schedule_reminder(tournament_id, match_id, kind, fire_at)
         else:
@@ -376,7 +574,7 @@ async def queue_match_reminders(
 async def extend_deadline(
     bot, tournament: aiosqlite.Row, match: aiosqlite.Row, hours: int
 ) -> datetime:
-    """Give a match more time and re-arm its nudges."""
+    """Extend match deadline and reschedule reminders."""
     tournament_id = int(tournament["challonge_id"])
     match_id = int(match["match_id"])
     now = datetime.now(timezone.utc)
@@ -390,11 +588,6 @@ async def extend_deadline(
         if fire_at > now:
             await bot.store.schedule_reminder(tournament_id, match_id, kind, fire_at)
     return deadline
-
-
-# ---------------------------------------------------------------------------
-# Live matches -> Discord scheduled events
-# ---------------------------------------------------------------------------
 
 
 async def sync_event(bot, tournament: aiosqlite.Row, match: aiosqlite.Row) -> None:
@@ -442,7 +635,6 @@ async def sync_event(bot, tournament: aiosqlite.Row, match: aiosqlite.Row) -> No
             else discord.EntityType.voice
         )
     else:
-        # External events must carry an end time, hence the duration setting.
         kwargs["entity_type"] = discord.EntityType.external
         kwargs["location"] = (
             (config["event_location"] if config else None) or "See the match thread"
@@ -487,18 +679,13 @@ async def _fetch_event(guild, event_id) -> discord.ScheduledEvent | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Misc
-# ---------------------------------------------------------------------------
-
-
 async def open_room(bot, tournament: aiosqlite.Row, match: aiosqlite.Row) -> str:
     """Reserve a Null Rush room for a match and record its code."""
     tournament_id = int(tournament["challonge_id"])
     match_id = int(match["match_id"])
 
     if match["room_code"]:
-        return str(match["room_code"])   # one room per match, reused
+        return str(match["room_code"])
 
     names = await bot.store.participant_names(tournament_id)
     room = await bot.relay.create_match(
@@ -525,7 +712,6 @@ async def push_result_to_challonge(
         scores_csv=scores,
         reason="admin:report",
     )
-    # One extra read so the bracket, threads and standings all move at once.
     await refresh_matches(bot, tournament, reason="admin:report")
 
 
@@ -536,10 +722,98 @@ async def warn_budget_if_needed(bot, channel) -> None:
         return
     try:
         await channel.send(
-            f":warning: Challonge API usage is at **{status.used}/{status.limit}** "
+            f"**Heads up:** Challonge API usage is at **{status.used}/{status.limit}** "
             "requests this month. Above the cap Challonge returns 429s until "
             "the plan is upgraded. Entering results on challonge.com never "
             "counts against this, only bracket syncs do."
         )
-    except Exception:  # noqa: BLE001 - a warning must never break the flow
+    except Exception:
         log.exception("could not deliver budget warning")
+
+
+@dataclass
+class EntrantSync:
+    """The outcome of reading the entrant list off Challonge."""
+
+    participants: list
+    signups: list
+    linked_now: int
+    linked_total: int
+    waiting: list
+    bracket_only: list
+
+
+async def sync_entrants(
+    bot, tournament: aiosqlite.Row, *, reason: str = "admin:entrants"
+) -> EntrantSync:
+    """Sync tournament participants from Challonge and match to Discord sign-ups."""
+    tournament_id = int(tournament["challonge_id"])
+    participants = await bot.challonge.list_participants(
+        tournament_id, reason=reason
+    )
+    await bot.store.replace_participants(tournament_id, participants)
+    linked_now = await bot.store.link_signups_to_bracket(tournament_id)
+
+    rows = await bot.store.list_participants(tournament_id)
+    signups = await bot.store.list_signups(tournament_id)
+    bracket_names = {row["name"].casefold() for row in rows}
+
+    return EntrantSync(
+        participants=rows,
+        signups=signups,
+        linked_now=linked_now,
+        linked_total=sum(1 for row in rows if row["discord_user_id"]),
+        waiting=[s for s in signups if s["name"].casefold() not in bracket_names],
+        bracket_only=[row for row in rows if not row["discord_user_id"]],
+    )
+
+
+@dataclass
+class RoundStart:
+    opened: list
+    completed: list
+    report: object
+    open_matches: list
+
+
+async def start_round(
+    bot,
+    tournament: aiosqlite.Row,
+    *,
+    announce: bool = True,
+    reason: str = "admin:round-start",
+):
+    """Refresh tournament bracket and create threads for open matches."""
+    from cogs.threads import ThreadReport
+
+    tournament_id = int(tournament["challonge_id"])
+    cog = bot.get_cog("ThreadsCog")
+    if cog is None:
+        opened, completed = await refresh_matches(bot, tournament, reason=reason)
+        fresh = await bot.store.get_tournament(tournament_id) or tournament
+        return RoundStart(
+            opened=opened,
+            completed=completed,
+            report=ThreadReport(error="The thread manager is not loaded."),
+            open_matches=await bot.store.list_matches(tournament_id, state="open"),
+        )
+
+    with cog.manual(tournament_id):
+        opened, completed = await refresh_matches(bot, tournament, reason=reason)
+        if opened and tournament["state"] == "pending":
+            await bot.store.set_tournament_state(tournament_id, "underway")
+
+        fresh = await bot.store.get_tournament(tournament_id) or tournament
+        report = await cog.open_threads(fresh, announce=False)
+
+    open_matches = await bot.store.list_matches(tournament_id, state="open")
+    if announce and (report.created or opened) and report.channel is not None:
+        names = await bot.store.participant_display(tournament_id)
+        await cog.announce_round(report.channel, fresh, open_matches, names)
+
+    return RoundStart(
+        opened=opened,
+        completed=completed,
+        report=report,
+        open_matches=open_matches,
+    )

@@ -10,9 +10,9 @@ from discord.ext import commands
 
 from challonge.client import NotFound, slug_from
 from cogs.common import (
-    FREE_MARK,
     BotError,
     active_tournament,
+    discord_ts,
     is_organizer,
     respond,
 )
@@ -31,6 +31,16 @@ class TournamentCog(commands.Cog):
         description="Tournament admin. Requires the tournament admin role.",
         guild_only=True,
         default_permissions=discord.Permissions(manage_guild=True),
+    )
+    sync_group = app_commands.Group(
+        name="sync",
+        description="Read things back off Challonge.",
+        parent=tournament_group,
+    )
+    round_group = app_commands.Group(
+        name="round",
+        description="Run the round: threads, players, announcement.",
+        parent=tournament_group,
     )
 
     # ------------------------------------------------------------------ post
@@ -229,6 +239,7 @@ class TournamentCog(commands.Cog):
         matches = await self.bot.store.list_matches(tournament_id)
         open_matches = [m for m in matches if m["state"] == "open"]
         participants = await self.bot.store.list_participants(tournament_id)
+        schedule = await schedule_line(self.bot, tournament)
 
         await respond(
             interaction,
@@ -248,43 +259,53 @@ class TournamentCog(commands.Cog):
                     1 for m in matches if m["state"] == "complete"
                 ),
                 threadless=sum(1 for m in open_matches if not m["thread_id"]),
+                schedule=schedule,
             ),
         )
 
-    @tournament_group.command(name="sync")
+    # ------------------------------------------------------ sync / round
+
+    @sync_group.command(name="entrants")
     @is_organizer()
-    async def sync(self, interaction: discord.Interaction) -> None:
-        """Read the bracket and entrants right now. Normally automatic."""
+    async def sync_entrants_command(self, interaction: discord.Interaction) -> None:
+        """Read the entrant list off Challonge and link sign-ups. 1 request."""
         await interaction.response.defer(ephemeral=True)
         tournament = await active_tournament(interaction)
-        tournament_id = int(tournament["challonge_id"])
+        await run_entrant_sync(self.bot, interaction, tournament)
 
-        # Fetch latest participants from Challonge so new entrants link to signups
-        participants = await self.bot.challonge.list_participants(
-            tournament_id, reason="admin:sync"
+    @round_group.command(name="start")
+    @is_organizer()
+    async def round_start(self, interaction: discord.Interaction) -> None:
+        """Sync matches, open a thread for every one, invite the players."""
+        await interaction.response.defer(ephemeral=True)
+        tournament = await active_tournament(interaction)
+        await run_round_start(self.bot, interaction, tournament)
+
+    @round_group.command(name="schedule")
+    @app_commands.describe(
+        first_day="Day round one is played: YYYY-MM-DD. 'off' clears the calendar",
+        days_per_round="Days from each round to the next. 0 puts them all on day one",
+        round_days="Or the exact days after the first, e.g. 0,3,7,10 (max day 13)",
+    )
+    @is_organizer()
+    async def round_schedule(
+        self,
+        interaction: discord.Interaction,
+        first_day: str | None = None,
+        days_per_round: int | None = None,
+        round_days: str | None = None,
+    ) -> None:
+        """Set the match days and round schedule."""
+        await interaction.response.defer(ephemeral=True)
+        tournament = await active_tournament(interaction)
+        await run_round_schedule(
+            self.bot,
+            interaction,
+            tournament,
+            first_day=first_day,
+            days_per_round=days_per_round,
+            round_days=round_days,
         )
-        await self.bot.store.replace_participants(tournament_id, participants)
-        linked = await self.bot.store.link_signups_to_bracket(tournament_id)
-
-        opened, completed = await self.bot.refresh_matches(
-            tournament, reason="admin:sync"
-        )
-        if opened and tournament["state"] == "pending":
-            await self.bot.store.set_tournament_state(tournament_id, "underway")
-
-        budget = await self.bot.budget.status()
-
-        from ui.views import refresh_panel
-
-        fresh = await self.bot.store.get_tournament(tournament_id)
-        await refresh_panel(self.bot, interaction.guild, fresh)
-
-        lines = [f"Synced **{len(participants)}** entrant(s) from Challonge."]
-        if linked:
-            lines.append(f"**{linked}** Discord sign-up(s) linked to the bracket!")
-        if opened or completed:
-            lines.append(f"**{len(opened)}** newly open, **{len(completed)}** newly completed.")
-        await respond(interaction, "\n".join(lines))
 
     @tournament_group.command(name="entrants")
     @app_commands.describe(
@@ -331,6 +352,172 @@ async def refresh_panel_safe(bot, guild, tournament) -> None:
     from ui.views import refresh_panel
 
     await refresh_panel(bot, guild, tournament)
+
+
+async def run_entrant_sync(bot, interaction: discord.Interaction, tournament) -> None:
+    """Sync entrants and update thread memberships."""
+    from services import sync_entrants
+    from ui.embeds import entrants_sync_embed
+    from ui.views import EntrantsSyncView
+
+    result = await sync_entrants(bot, tournament)
+
+    joined = 0
+    threads = bot.get_cog("ThreadsCog")
+    if threads is not None and result.linked_now:
+        joined = await threads.sync_thread_members(tournament)
+
+    fresh = await bot.store.get_tournament(int(tournament["challonge_id"]))
+    await refresh_panel_safe(bot, interaction.guild, fresh or tournament)
+
+    await respond(
+        interaction,
+        embed=entrants_sync_embed(
+            fresh or tournament,
+            result,
+            budget=await bot.budget.status(),
+            thread_joins=joined,
+        ),
+        view=EntrantsSyncView(bot),
+    )
+
+
+OFF_WORDS = {"off", "none", "clear", "never", "-"}
+
+
+async def schedule_line(bot, tournament) -> str | None:
+    """Format round schedule status line."""
+    from services import end_of_day, guild_timezone, late_matches, round_plan
+    from timeparse import get_zone
+
+    plan = await round_plan(bot, tournament)
+    if plan is None:
+        return None
+
+    zone = get_zone(await guild_timezone(bot, int(tournament["guild_id"])))
+    closes = end_of_day(plan.last_day, zone)
+    line = (
+        f"**{plan.total_days}** day(s) in all, ending {discord_ts(closes, 'D')} "
+        f"({discord_ts(closes, 'R')}).\n`/tournament round schedule` to move it."
+    )
+    late = late_matches(
+        await bot.store.list_matches(int(tournament["challonge_id"]), state="open")
+    )
+    if late:
+        line += f"\n**{len(late)}** match(es) are booked past their round."
+    return line
+
+
+async def run_round_schedule(
+    bot,
+    interaction: discord.Interaction,
+    tournament,
+    *,
+    first_day: str | None = None,
+    days_per_round: int | None = None,
+    round_days: str | None = None,
+) -> None:
+    """View or update round schedule settings."""
+    from services import (
+        MAX_ROUND_DAYS,
+        MAX_TOURNAMENT_DAYS,
+        apply_round_plan,
+        parse_day,
+        parse_round_days,
+    )
+    from ui.embeds import round_schedule_embed
+    from ui.views import RoundScheduleView
+
+    guild_id = interaction.guild_id
+    changed: list[str] = []
+    clearing = first_day is not None and first_day.strip().lower() in OFF_WORDS
+
+    if not clearing and first_day is not None:
+        try:
+            parse_day(first_day)
+        except ValueError:
+            raise BotError(
+                f"`{first_day}` is not a date I can read. Write it as "
+                "`YYYY-MM-DD`, for example `2026-09-12`. `off` clears the "
+                "calendar."
+            ) from None
+        changed.append(f"first match day **{first_day.strip()}**")
+
+    if days_per_round is not None and not 0 <= days_per_round <= MAX_ROUND_DAYS:
+        raise BotError(
+            f"Pick between 0 and {MAX_ROUND_DAYS} days between rounds. A "
+            f"tournament runs {MAX_TOURNAMENT_DAYS} days at the most, so a "
+            "bigger gap could not fit even two rounds."
+        )
+    if days_per_round is not None:
+        changed.append(
+            f"**{days_per_round} day(s)** between rounds"
+            if days_per_round
+            else "every round on the **same day**"
+        )
+
+    if round_days is not None and round_days.strip():
+        try:
+            parsed = parse_round_days(round_days)
+        except ValueError as exc:
+            raise BotError(
+                f"I cannot read `{round_days}` as round days: {exc}. Give days "
+                "counted from the first match day, lowest first, like `0,3,7`."
+            ) from None
+        changed.append("round days **" + ",".join(str(d) for d in parsed) + "**")
+
+    config = await bot.store.get_guild_config(guild_id)
+    existing_day = config["first_match_day"] if config else None
+    if changed and not clearing and not (first_day or existing_day):
+        raise BotError(
+            "Give me the day round one is played first: "
+            "`/tournament round schedule first_day:YYYY-MM-DD`."
+        )
+
+    applied = 0
+    if clearing:
+        await bot.store.set_guild_config(guild_id, clear_schedule=True)
+        changed = ["calendar **cleared**"]
+        applied = await apply_round_plan(bot, tournament)
+    elif changed:
+        await bot.store.set_guild_config(
+            guild_id,
+            first_match_day=first_day.strip() if first_day else None,
+            days_per_round=days_per_round,
+            round_days=round_days.strip() if round_days is not None else None,
+        )
+        applied = await apply_round_plan(bot, tournament)
+
+    await respond(
+        interaction,
+        f"Updated: {', '.join(changed)}." if changed else None,
+        embed=await round_schedule_embed(bot, tournament, restamped=applied),
+        view=RoundScheduleView(bot),
+    )
+
+
+async def run_round_start(bot, interaction: discord.Interaction, tournament) -> None:
+    """Sync bracket and open missing match threads."""
+    from services import start_round
+    from ui.embeds import round_start_embed
+    from ui.views import RoundStartView
+
+    result = await start_round(bot, tournament)
+
+    tournament_id = int(tournament["challonge_id"])
+    fresh = await bot.store.get_tournament(tournament_id) or tournament
+    await refresh_panel_safe(bot, interaction.guild, fresh)
+
+    await respond(
+        interaction,
+        embed=round_start_embed(
+            fresh,
+            result,
+            names=await bot.store.participant_display(tournament_id),
+            budget=await bot.budget.status(),
+        ),
+        view=RoundStartView(bot),
+    )
 
 
 async def setup(bot) -> None:

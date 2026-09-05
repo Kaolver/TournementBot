@@ -4,36 +4,45 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import httpx  # noqa: E402
+import discord
+import httpx
 
-from challonge.budget import (  # noqa: E402
+from challonge.budget import (
     ADMIN_REASONS,
     REASONS,
     Budget,
     BudgetExhausted,
     UnknownReason,
 )
-from challonge.client import ChallongeClient, NotFound, slug_from  # noqa: E402
-from db.dialect import rowcount_from_status, to_postgres  # noqa: E402
-from nullrush import RelayClient, RelayError  # noqa: E402
-from db.store import Store  # noqa: E402
-from db.supabase import (  # noqa: E402
+from challonge.client import ChallongeClient, NotFound, slug_from
+from db.dialect import rowcount_from_status, to_postgres
+from nullrush import RelayClient, RelayError
+from db.store import Store
+from db.supabase import (
     SupabaseBackend,
     SupabaseError,
     normalise_url,
 )
-from services import (  # noqa: E402
+from services import (
     DEADLINE_KINDS,
+    MAX_ROUND_DAYS,
+    MAX_TOURNAMENT_DAYS,
     accept_proposal,
+    build_round_plan,
+    end_of_day,
+    parse_round_days,
+    round_offsets,
+    round_sequence,
     evaluate_refresh,
     extend_deadline,
     force_time,
@@ -45,7 +54,7 @@ from services import (  # noqa: E402
     start_scheduling_window,
     sync_event,
 )
-from timeparse import TimeParseError, parse_when  # noqa: E402
+from timeparse import TimeParseError, parse_when
 
 PASSED = 0
 FAILED = 0
@@ -215,6 +224,257 @@ class FakeGuild:
         self.events[event.id] = event
         self.created.append(kwargs)
         return event
+
+
+class FakeMessage:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.pinned = False
+        self.jump_url = "https://discord.test/message"
+
+    async def pin(self) -> None:
+        self.pinned = True
+
+
+class FakeThread:
+    """Stands in for discord.Thread."""
+
+    def __init__(self, thread_id: int, **kwargs) -> None:
+        self.id = thread_id
+        self.kwargs = kwargs
+        self.archived = False
+        self.messages: list[FakeMessage] = []
+        self.members: set[int] = set()
+
+    async def send(self, **kwargs) -> FakeMessage:
+        message = FakeMessage(**kwargs)
+        self.messages.append(message)
+        return message
+
+    async def add_user(self, user) -> None:
+        self.members.add(int(user.id))
+
+
+class FakeTextChannel:
+    """Stands in for discord.TextChannel."""
+
+    def __init__(self, channel_id: int) -> None:
+        self.id = channel_id
+        self.name = "tournament"
+        self.threads: list[FakeThread] = []
+        self.messages: list[FakeMessage] = []
+        self._next_id = 8000
+
+    async def create_thread(self, **kwargs) -> FakeThread:
+        self._next_id += 1
+        thread = FakeThread(self._next_id, **kwargs)
+        self.threads.append(thread)
+        return thread
+
+    async def send(self, **kwargs) -> FakeMessage:
+        message = FakeMessage(**kwargs)
+        self.messages.append(message)
+        return message
+
+
+async def round_start_flow(tmp: str) -> None:
+    """The two organiser commands, end to end, on their own bracket."""
+    from cogs.threads import ThreadsCog
+    from services import start_round, sync_entrants
+
+    server = FakeChallonge()
+    server.add_players(["Ana", "Bo", "Cy", "Dee"])
+    store = Store(str(Path(tmp) / "round.db"))
+    await store.connect()
+    budget = Budget(store, limit=500)
+    client = ChallongeClient(
+        "fake-key", budget, transport=httpx.MockTransport(server.handle)
+    )
+    channel = FakeTextChannel(77)
+    guild = FakeGuild(42)
+    bot = SimpleNamespace(
+        store=store,
+        challonge=client,
+        budget=budget,
+        dispatch=lambda name, *args: None,
+        get_guild=lambda gid: guild if int(gid) == guild.id else None,
+        get_channel=lambda cid: channel if int(cid) == channel.id else None,
+    )
+    threads = ThreadsCog(bot)
+    # The real one insists on a discord.TextChannel.
+    threads._channel = lambda tournament: channel  # type: ignore[assignment]
+    bot.get_cog = lambda name: threads if name == "ThreadsCog" else None
+    bot.refresh_matches = lambda t, reason="autosync": refresh_matches(
+        bot, t, reason=reason
+    )
+
+    fetched = await client.get_tournament("selftest_cup", reason="admin:post")
+    await store.save_tournament(fetched, guild_id=42, channel_id=channel.id)
+    tournament = await store.get_tournament(9001)
+
+    # Three of the four are on Discord; Dee never signed up.
+    for user_id, name in ((500, "Ana"), (501, "Bo"), (502, "Cy")):
+        await store.upsert_signup(9001, user_id, name)
+
+    entrants = await sync_entrants(bot, tournament)
+    check("sync entrants reads the bracket once", len(server.requests) == 2)
+    check("it finds every entrant", len(entrants.participants) == 4)
+    check("and links the three sign-ups", entrants.linked_now == 3, str(entrants.linked_now))
+    check("leaving one on the bracket only", len(entrants.bracket_only) == 1)
+    check("it opens no threads at all", not channel.threads)
+
+    first_day = (datetime.now(timezone.utc) + timedelta(days=7)).date()
+    await store.set_guild_config(
+        42,
+        tz="UTC",
+        deadline_hours=240,
+        first_match_day=first_day.isoformat(),
+        days_per_round=2,
+    )
+
+    server.start()
+    before = len(server.requests)
+    result = await start_round(bot, tournament)
+    check("round start reads the bracket once", len(server.requests) - before == 1)
+    check("both matches are live", len(result.open_matches) == 2)
+    check(
+        "every match got a thread, linked or not",
+        len(result.report.created) == 2,
+        str(len(result.report.created)),
+    )
+    check(
+        "the threads are public",
+        all(
+            t.kwargs["type"] is discord.ChannelType.public_thread
+            for t in channel.threads
+        ),
+    )
+    check(
+        "no thread is created invite-only",
+        all("invitable" not in t.kwargs for t in channel.threads),
+    )
+    check(
+        "every player we know of was added",
+        sorted(m for t in channel.threads for m in t.members) == [500, 501, 502],
+    )
+    check(
+        "the half-linked match says who is missing",
+        any(
+            "Dee" in (t.messages[0].kwargs.get("content") or "")
+            for t in channel.threads
+        ),
+    )
+    check("the round is announced once, in the channel", len(channel.messages) == 1)
+    check(
+        "the bracket is marked underway",
+        (await store.get_tournament(9001))["state"] == "underway",
+    )
+
+    from db.store import _parse_iso as parse_stamp
+    from services import apply_round_plan, round_plan
+
+    plan = await round_plan(bot, tournament)
+    check("the calendar covers both rounds", len(plan.order) == 2)
+    check(
+        "and fixes the event at three days",
+        plan.total_days == 3,
+        str(plan.total_days),
+    )
+    opener = await store.get_match(9001, 1)
+    play_by = parse_stamp(opener["play_by"])
+    check("round one is stamped on its matches", play_by is not None)
+    check(
+        "it closes at the end of the first match day",
+        play_by == end_of_day(first_day, timezone.utc),
+        str(play_by),
+    )
+    check(
+        "a 10-day deadline is cut back to the end of the round",
+        parse_stamp(opener["deadline_at"]) == play_by,
+        str(opener["deadline_at"]),
+    )
+
+    touched = await apply_round_plan(bot, tournament)
+    final = await store.get_match(9001, 3)
+    check("re-stamping covers every unplayed match", touched == 3, str(touched))
+    check(
+        "the final is two days after the first round",
+        parse_stamp(final["play_by"])
+        == end_of_day(first_day + timedelta(days=2), timezone.utc),
+    )
+
+    from cogs.common import BotError
+    from ui.views import _check_within_round
+
+    player = SimpleNamespace(guild_id=42, user=SimpleNamespace(id=500))
+    await _check_within_round(
+        bot, tournament, opener, play_by - timedelta(hours=2), player
+    )
+    check("a time inside the round is allowed", True)
+    try:
+        await _check_within_round(
+            bot, tournament, opener, play_by + timedelta(hours=2), player
+        )
+        check("a time after the round is refused", False)
+    except BotError:
+        check("a time after the round is refused", True)
+
+    await store.set_guild_config(42, clear_schedule=True)
+    await apply_round_plan(bot, tournament)
+    check(
+        "clearing the calendar unstamps the matches",
+        (await store.get_match(9001, 1))["play_by"] is None,
+    )
+    check(
+        "and the deadline goes back to the configured hours",
+        parse_stamp((await store.get_match(9001, 1))["deadline_at"]) > play_by,
+    )
+    await store.set_guild_config(
+        42, first_match_day=first_day.isoformat(), days_per_round=2
+    )
+    await apply_round_plan(bot, tournament)
+
+    from ui.embeds import (
+        entrants_sync_embed,
+        round_schedule_embed,
+        round_start_embed,
+    )
+
+    status = await budget.status()
+    panels = [
+        entrants_sync_embed(tournament, entrants, budget=status, thread_joins=3),
+        await round_schedule_embed(bot, tournament, restamped=3),
+        round_start_embed(
+            tournament,
+            result,
+            names=await store.participant_display(9001),
+            budget=status,
+        ),
+    ]
+    check(
+        "every result panel builds with fields",
+        all(len(p.fields) >= 4 for p in panels),
+    )
+    check(
+        "no field is empty or over length",
+        all(
+            f.value and len(f.value) <= 1024 and f.name
+            for p in panels
+            for f in p.fields
+        ),
+    )
+    check(
+        "the round panel links the threads",
+        any("<#" in (f.value or "") for f in panels[-1].fields),
+    )
+
+    again = await start_round(bot, tournament)
+    check("running it again opens nothing new", not again.report.created)
+    check("and finds the existing threads", len(again.report.existing) == 2)
+    check("still only two threads", len(channel.threads) == 2)
+
+    await client.aclose()
+    await store.close()
 
 
 # ------------------------------------------------------------------- harness
@@ -401,7 +661,7 @@ async def run() -> None:
             pairs.append(len(reachable))
         pairs.sort()
         check(
-            "only the fully claimed pairing can get one",
+            "a half-claimed pairing wants one all the same",
             pairs == [1, 2],
             str(pairs),
         )
@@ -759,9 +1019,11 @@ async def run() -> None:
 
         # Every reason the code actually uses has to be one the policy knows.
         declared = set()
+        reason_literal = re.compile(r'reason(?:\s*:\s*str)?\s*=\s*"([^"]+)"')
         for path in list((root / "cogs").glob("*.py")) + [root / "services.py"]:
-            for chunk in path.read_text(encoding="utf-8").split('reason="')[1:]:
-                declared.add(chunk.split('"')[0])
+            declared.update(
+                reason_literal.findall(path.read_text(encoding="utf-8"))
+            )
         check(
             "every declared reason is in the closed set",
             declared <= REASONS,
@@ -1100,7 +1362,87 @@ async def run() -> None:
             not missing,
             f"missing: {missing}",
         )
-        print("\n22. what the whole tournament cost")
+        print("\n22. the round calendar")
+        check(
+            "rounds are put in the order they are played",
+            round_sequence([2, -1, 1, -2]) == [1, -1, 2, -2],
+        )
+        check("uneven match days are read", parse_round_days("0, 3,7") == [0, 3, 7])
+        check("an empty setting means no custom plan", parse_round_days("") == [])
+        for bad in ("7,3", "x", "-1", "0,20"):
+            try:
+                parse_round_days(bad)
+                check(f"{bad!r} is refused", False)
+            except ValueError:
+                check(f"{bad!r} is refused", True)
+
+        check(
+            "a uniform gap covers the whole bracket",
+            round_offsets(3, days_per_round=4) == [0, 4, 8],
+        )
+        check(
+            "a short custom list is extended by its own last gap",
+            round_offsets(5, custom=[0, 2, 5]) == [0, 2, 5, 8, 11],
+        )
+        check(
+            "no gap at all puts every round on the first day",
+            round_offsets(3) == [0, 0, 0],
+        )
+        check(
+            f"nothing is ever placed past day {MAX_ROUND_DAYS}",
+            round_offsets(4, days_per_round=7) == [0, 7, 13, 13],
+        )
+        check(
+            "a custom day beyond the limit is pulled back too",
+            round_offsets(4, custom=[0, 3, 7, 40]) == [0, 3, 7, 13],
+        )
+
+        plan = build_round_plan(
+            [1, 2, 3], first_day=date(2026, 9, 12), days_per_round=4
+        )
+        check("every round gets a day", len(plan.days) == 3)
+        check("the final is eight days out", plan.last_day == date(2026, 9, 20))
+        check(
+            "so the organiser knows the length up front",
+            plan.total_days == 9,
+            str(plan.total_days),
+        )
+        check("and nothing had to be pulled back", not plan.clamped)
+
+        long_plan = build_round_plan(
+            [1, 2, 3, 4], first_day=date(2026, 9, 12), days_per_round=7
+        )
+        check(
+            "a tournament can never run past two weeks",
+            long_plan.total_days == MAX_TOURNAMENT_DAYS,
+            str(long_plan.total_days),
+        )
+        check(
+            "and it says which rounds it had to pull back",
+            long_plan.clamped == [3, 4],
+            str(long_plan.clamped),
+        )
+        check(
+            "even an absurd gap stays inside the fortnight",
+            build_round_plan(
+                [1, 2], first_day=date(2026, 9, 12), days_per_round=999
+            ).total_days
+            == MAX_TOURNAMENT_DAYS,
+        )
+        check(
+            "a one-day event is one day long",
+            build_round_plan([1, 2], first_day=date(2026, 9, 12)).total_days == 1,
+        )
+        check(
+            "a round closes at the end of its day",
+            end_of_day(date(2026, 9, 12), timezone.utc)
+            == datetime(2026, 9, 12, 23, 59, tzinfo=timezone.utc),
+        )
+
+        print("\n23. sync entrants, then start the round")
+        await round_start_flow(tmp)
+
+        print("\n24. what the whole tournament cost")
         for method, path in server.requests:
             print(f"     {method:6} {path}")
         check(

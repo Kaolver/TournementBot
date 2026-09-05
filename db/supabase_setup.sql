@@ -61,7 +61,10 @@ CREATE TABLE IF NOT EXISTS tournamentbot.guilds (
     syncs_per_day         INTEGER NOT NULL DEFAULT 12,
     event_channel_id      BIGINT,
     event_location        TEXT,
-    event_duration        INTEGER NOT NULL DEFAULT 60
+    event_duration        INTEGER NOT NULL DEFAULT 60,
+    first_match_day       TEXT,
+    days_per_round        INTEGER NOT NULL DEFAULT 0,
+    round_days            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tournamentbot.tournaments (
@@ -119,6 +122,7 @@ CREATE TABLE IF NOT EXISTS tournamentbot.matches (
     scheduled_at      TEXT,
     agreed_at         TEXT,
     deadline_at       TEXT,
+    play_by           TEXT,
     scheduling_status TEXT   NOT NULL DEFAULT 'pending',
     live              INTEGER NOT NULL DEFAULT 0,
     event_id          BIGINT,
